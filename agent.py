@@ -1,5 +1,4 @@
 import os
-import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlparse
@@ -9,6 +8,7 @@ from agno.db.sqlite import SqliteDb
 from agno.memory import MemoryManager
 from agno.models.openai.like import OpenAILike
 from agno.skills import LocalSkills, Skills
+from storage_data import initialize_database, get_sqlite_db
 from tools import get_agent_tools
 
 
@@ -73,11 +73,24 @@ def _agent_operational_instructions() -> list[str]:
         (
             "Se la richiesta fa riferimento a una foto inviata dall'utente, usa prima `describe_image` "
             "e poi inserisci nel `context_summary` i dettagli salienti emersi dalla foto insieme a un "
-            "suggerimento operativo su come proseguire il task."
+            "suggerimento operativo su come proseguire il task. Se l'utente chiede solo di allegarla, non descrivere l'immagine o il file."
+        ),
+        (
+            "Per recuperare lo stato delle richieste, task o approvazioni dell'utente usa il tool `get_task_status`."
+        ),
+        (
+            "Se l'utente invia un file (documento o immagine) e chiede di allegarlo a un task, "
+            "usa il tool `add_task_attachment` specificando l'ID del task. "
+            "Se l'ID non è presente nel messaggio o nel contesto, chiedilo all'utente prima di procedere."
+        ),
+        (
+            "Per domande sulla situazione attuale dell'hotel The Castelletto (es. colazione, parcheggio, pulizie, presenze "
+            "in cucina/lobby/patio/ingresso) usa il tool `castelletto_camera_analyze` scegliendo la telecamera "
+            "e l'azione più appropriate. Rispondi sempre in italiano con un'interpretazione naturale del risultato."
         ),
         (
             "Rispondi sempre in modo conciso e operativo, evitando di essere prolisso o di ripetere informazioni già presenti nella memoria. "
-            "Usa sempre la stessa lingua della richiesta dell'utente (italiano o inglese) e non tradurre mai le parole chiave dei tool (es. `create_sharepoint_approval_task`, `describe_image`) in italiano."
+            "Usa sempre la stessa lingua della richiesta dell'utente (italiano o inglese) e non tradurre mai le parole chiave dei tool (es. `create_sharepoint_approval_task`, `describe_image`, `get_task_status`) in italiano."
         ),
     ]
 
@@ -120,34 +133,8 @@ def build_agent_context() -> AgentContext:
     base_url = _normalize_openai_base_url(llm_endpoint)
     agent_id = os.getenv("AGENT_ID", "marco-telegram-agent")
 
-    db = SqliteDb(
-        db_file=db_file,
-        session_table=os.getenv("AGNO_SESSION_TABLE", "telegram_sessions"),
-        memory_table=os.getenv("AGNO_MEMORY_TABLE", "user_memories"),
-    )
-
-    # Create users table if not exists
-    conn = sqlite3.connect(db_file)
-    conn.execute('''
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            telegram_id TEXT UNIQUE NOT NULL,
-            email TEXT,
-            role TEXT CHECK(role IN ('admin', 'user')) NOT NULL,
-            mobile_phone TEXT,
-            full_name TEXT
-        )
-    ''')
-    # Insert seed data if not exists
-    cursor = conn.cursor()
-    cursor.execute("SELECT COUNT(*) FROM users WHERE telegram_id = ?", ("8594319243",))
-    if cursor.fetchone()[0] == 0:
-        conn.execute('''
-            INSERT INTO users (telegram_id, email, role, mobile_phone, full_name)
-            VALUES (?, ?, ?, ?, ?)
-        ''', ("8594319243", "andrea.menozzi@infinitearea.com", "admin", "+393479351303", "Andrea Menozzi"))
-    conn.commit()
-    conn.close()
+    initialize_database(db_file)
+    db = get_sqlite_db(db_file)
 
     memory_capture_instructions = _memory_capture_instructions()
     memory_additional_instructions = _memory_additional_instructions()

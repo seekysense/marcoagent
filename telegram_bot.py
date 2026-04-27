@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import random
 import re
 import time
 from contextlib import asynccontextmanager
@@ -13,8 +14,17 @@ from agent import AgentContext, build_agent_context, require_env
 from agno.media import Image
 from agno.os.app import AgentOS
 from agno.os.interfaces.telegram import Telegram
-from tools import reset_current_run_image_for_tools, set_current_run_image_for_tools
+from storage_data import get_user_by_telegram_id, register_user_from_contact
+from tools import (
+    reset_current_requester_email,
+    reset_current_run_attachment_for_tools,
+    reset_current_run_image_for_tools,
+    set_current_requester_email,
+    set_current_run_attachment_for_tools,
+    set_current_run_image_for_tools,
+)
 from utilities import (
+    download_telegram_document,
     markdown_to_telegram_payload,
     normalize_whisper_language,
     preprocess_telegram_image_for_llm,
@@ -185,6 +195,17 @@ def _extract_photo_file_id(message: dict[str, Any]) -> str | None:
     return str(best["file_id"])
 
 
+def _extract_document(message: dict[str, Any]) -> tuple[str | None, str, str]:
+    """Returns (file_id, filename, mime_type) for document messages, or (None, '', '') if absent."""
+    doc = message.get("document")
+    if not isinstance(doc, dict) or not doc.get("file_id"):
+        return None, "", ""
+    file_id = str(doc["file_id"])
+    filename = str(doc.get("file_name") or "allegato").strip()
+    mime_type = str(doc.get("mime_type") or "application/octet-stream").strip()
+    return file_id, filename, mime_type
+
+
 async def _send_telegram_message(
     token: str,
     chat_id: str | int,
@@ -245,7 +266,73 @@ async def _send_telegram_message(
                 )
 
 
+def _normalize_phone(phone: str) -> str:
+    phone = phone.strip()
+    if phone.startswith("+"):
+        return phone
+    if phone.startswith("00"):
+        return "+" + phone[2:]
+    return "+39" + phone
+
+
+async def _request_contact_sharing(
+    token: str,
+    chat_id: str | int,
+    message_thread_id: str | int | None = None,
+) -> None:
+    payload: dict[str, Any] = {
+        "chat_id": chat_id,
+        "text": (
+            "Per utilizzare questo bot devi essere registrato. "
+            "Condividi il tuo numero di telefono premendo il pulsante qui sotto."
+        ),
+        "reply_markup": {
+            "keyboard": [[{"text": "📱 Condividi il tuo numero", "request_contact": True}]],
+            "one_time_keyboard": True,
+            "resize_keyboard": True,
+        },
+    }
+    if message_thread_id is not None:
+        payload["message_thread_id"] = int(message_thread_id)
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        await client.post(f"https://api.telegram.org/bot{token}/sendMessage", json=payload)
+
+
+async def _send_message_remove_keyboard(
+    token: str,
+    chat_id: str | int,
+    text: str,
+    message_thread_id: str | int | None = None,
+) -> None:
+    payload: dict[str, Any] = {
+        "chat_id": chat_id,
+        "text": text,
+        "reply_markup": {"remove_keyboard": True},
+    }
+    if message_thread_id is not None:
+        payload["message_thread_id"] = int(message_thread_id)
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        await client.post(f"https://api.telegram.org/bot{token}/sendMessage", json=payload)
+
+
 load_dotenv()
+
+# Lista di frasi di feedback random
+FEEDBACK_PHRASES = [
+    "Ok, ci lavoro!",
+    "Dammi un attimo, fammi pensare...",
+    "Ricevuto! Inizio a lavorarci...",
+    "Messaggio preso in carico, elaboro subito.",
+    "Capito, sto elaborando la tua richiesta.",
+    "Un momento, sto pensando alla risposta.",
+    "Ricevuto, procedo con l'elaborazione.",
+    "Ok, mi metto al lavoro!",
+    "Messaggio ricevuto, inizio l'analisi.",
+    "D'accordo, sto elaborando..."
+]
+
+def get_random_feedback_phrase() -> str:
+    return random.choice(FEEDBACK_PHRASES)
 
 # Telegram webhook secret checks are strict outside development mode.
 if not os.getenv("APP_ENV"):
@@ -405,160 +492,313 @@ async def run_telegram_polling_loop() -> None:
 
                 message_obj = update.get("message") or update.get("edited_message") or {}
                 user_id_raw = (message_obj.get("from") or {}).get("id")
-                user_id_for_memory = str(user_id_raw) if user_id_raw is not None else None
                 chat_id_for_send = (message_obj.get("chat") or {}).get("id")
                 thread_id_for_send = message_obj.get("message_thread_id")
+                user_id_for_memory = str(user_id_raw) if user_id_raw is not None else None
                 chat_id_for_scope = str(chat_id_for_send) if chat_id_for_send is not None else None
                 thread_id_for_scope = str(thread_id_for_send) if thread_id_for_send is not None else None
-                session_scope_for_media = _build_session_scope(agent_id, chat_id_for_scope, thread_id_for_scope)
+                session_scope = _build_session_scope(agent_id, chat_id_for_scope, thread_id_for_scope)
                 existing_text = (message_obj.get("text") or message_obj.get("caption") or "").strip()
 
-                photo_file_id = _extract_photo_file_id(message_obj)
-                if photo_file_id:
-                    try:
-                        processed_image = await preprocess_telegram_image_for_llm(
-                            token=telegram_token,
-                            file_id=photo_file_id,
-                            update_id=update_id if isinstance(update_id, int) else None,
-                            logger=logger,
+                # --- Contact sharing ---
+                contact = message_obj.get("contact")
+                if isinstance(contact, dict) and user_id_for_memory and chat_id_for_send is not None:
+                    phone_raw = str(contact.get("phone_number") or "").strip()
+                    phone = _normalize_phone(phone_raw) if phone_raw else ""
+                    first_name = str(contact.get("first_name") or "").strip()
+                    last_name = str(contact.get("last_name") or "").strip()
+                    full_name = " ".join(filter(None, [first_name, last_name])) or "Utente"
+                    if phone:
+                        register_user_from_contact(
+                            agent_context.db_file, user_id_for_memory, phone, full_name
                         )
-                        image_prompt = existing_text or os.getenv(
-                            "IMAGE_DEFAULT_PROMPT",
-                            "Analizza l'immagine e rispondi in modo utile.",
-                        )
-
                         logger.info(
-                            "image preprocessing done update_id=%s file=%s local_path=%s original=%sx%s output=%sx%s",
-                            update_id,
-                            processed_image.telegram_file_path,
-                            processed_image.local_path,
-                            processed_image.original_width,
-                            processed_image.original_height,
-                            processed_image.output_width,
-                            processed_image.output_height,
+                            "user registered from contact telegram_id=%s phone=%s",
+                            user_id_for_memory,
+                            phone,
                         )
+                        await _send_message_remove_keyboard(
+                            token=telegram_token,
+                            chat_id=chat_id_for_send,
+                            text=f"Benvenuto {first_name or 'utente'}! Registrazione completata. Ora puoi usarmi.",
+                            message_thread_id=thread_id_for_send,
+                        )
+                    else:
+                        await _send_telegram_message(
+                            token=telegram_token,
+                            chat_id=chat_id_for_send,
+                            text="Non ho ricevuto un numero di telefono valido. Riprova.",
+                            message_thread_id=thread_id_for_send,
+                        )
+                    continue
 
+                # --- User recognition ---
+                user_record: dict | None = None
+                if user_id_for_memory and chat_id_for_send is not None:
+                    user_record = get_user_by_telegram_id(agent_context.db_file, user_id_for_memory)
+                    if user_record is None:
+                        logger.info(
+                            "unknown user telegram_id=%s, requesting contact sharing",
+                            user_id_for_memory,
+                        )
+                        await _request_contact_sharing(
+                            token=telegram_token,
+                            chat_id=chat_id_for_send,
+                            message_thread_id=thread_id_for_send,
+                        )
+                        continue
+
+                # --- Immediate feedback ---
+                if chat_id_for_send is not None:
+                    await _send_telegram_message(
+                        token=telegram_token,
+                        chat_id=chat_id_for_send,
+                        text=get_random_feedback_phrase(),
+                        message_thread_id=thread_id_for_send,
+                    )
+
+                user_email = (user_record.get("email") or "").strip() if user_record else None
+                requester_email_token = set_current_requester_email(user_email or None)
+                attachment_token = set_current_run_attachment_for_tools(b"", "")
+                try:
+                    # --- Document ---
+                    doc_file_id, doc_filename, doc_mime_type = _extract_document(message_obj)
+                    if doc_file_id:
+                        try:
+                            doc_result = await download_telegram_document(
+                                token=telegram_token,
+                                file_id=doc_file_id,
+                                filename=doc_filename,
+                                update_id=update_id if isinstance(update_id, int) else None,
+                                logger=logger,
+                            )
+                            attachment_token_inner = set_current_run_attachment_for_tools(
+                                file_bytes=doc_result.file_bytes,
+                                filename=doc_result.filename,
+                                mime_type=doc_mime_type,
+                            )
+                            logger.info(
+                                "document downloaded update_id=%s filename=%s size=%s",
+                                update_id,
+                                doc_result.filename,
+                                len(doc_result.file_bytes),
+                            )
+                            agent_input = (
+                                f"[Allegato: {doc_result.filename}] {existing_text}"
+                                if existing_text
+                                else f"[Allegato: {doc_result.filename}]"
+                            )
+                            run_kwargs: dict[str, Any] = {
+                                "stream": False,
+                                "user_id": user_id_for_memory,
+                            }
+                            if session_scope:
+                                run_kwargs["session_id"] = session_scope
+                            try:
+                                run_output = await agent_context.agent.arun(agent_input, **run_kwargs)
+                            finally:
+                                reset_current_run_attachment_for_tools(attachment_token_inner)
+                            run_content = str(getattr(run_output, "content", "") or "").strip()
+                            if chat_id_for_send is not None:
+                                await _send_telegram_message(
+                                    token=telegram_token,
+                                    chat_id=chat_id_for_send,
+                                    text=run_content or "Operazione completata.",
+                                    message_thread_id=thread_id_for_send,
+                                )
+                        except Exception:
+                            logger.exception("document pipeline failed update_id=%s", update_id)
+                            if chat_id_for_send is not None:
+                                await _send_telegram_message(
+                                    token=telegram_token,
+                                    chat_id=chat_id_for_send,
+                                    text="Errore durante la gestione del documento. Riprova.",
+                                    message_thread_id=thread_id_for_send,
+                                )
+                        continue
+
+                    # --- Photo ---
+                    photo_file_id = _extract_photo_file_id(message_obj)
+                    if photo_file_id:
+                        try:
+                            processed_image = await preprocess_telegram_image_for_llm(
+                                token=telegram_token,
+                                file_id=photo_file_id,
+                                update_id=update_id if isinstance(update_id, int) else None,
+                                logger=logger,
+                            )
+                            attachment_token_inner = set_current_run_attachment_for_tools(
+                                file_bytes=processed_image.image_bytes,
+                                filename=f"photo_{update_id or 'x'}.jpg",
+                                mime_type="image/jpeg",
+                            )
+                            image_prompt = existing_text or os.getenv(
+                                "IMAGE_DEFAULT_PROMPT",
+                                "Analizza l'immagine e rispondi in modo utile.",
+                            )
+                            logger.info(
+                                "image preprocessing done update_id=%s file=%s local_path=%s original=%sx%s output=%sx%s",
+                                update_id,
+                                processed_image.telegram_file_path,
+                                processed_image.local_path,
+                                processed_image.original_width,
+                                processed_image.original_height,
+                                processed_image.output_width,
+                                processed_image.output_height,
+                            )
+                            run_kwargs: dict[str, Any] = {
+                                "stream": False,
+                                "user_id": user_id_for_memory,
+                                "add_history_to_context": _bool_env("IMAGE_ADD_HISTORY_TO_CONTEXT", False),
+                                "images": [Image(content=processed_image.image_bytes)],
+                            }
+                            if session_scope:
+                                run_kwargs["session_id"] = session_scope
+                            image_context_token = set_current_run_image_for_tools(
+                                image_bytes=processed_image.image_bytes,
+                                local_path=processed_image.local_path,
+                                telegram_file_path=processed_image.telegram_file_path,
+                                user_id=user_id_for_memory,
+                                session_id=session_scope,
+                            )
+                            try:
+                                run_output = await agent_context.agent.arun(image_prompt, **run_kwargs)
+                            finally:
+                                reset_current_run_image_for_tools(image_context_token)
+                                reset_current_run_attachment_for_tools(attachment_token_inner)
+                            run_status = str(getattr(run_output, "status", ""))
+                            run_content = str(getattr(run_output, "content", "") or "").strip()
+                            logger.info(
+                                "image direct-run completed update_id=%s status=%s has_content=%s",
+                                update_id,
+                                run_status,
+                                bool(run_content),
+                            )
+                            if chat_id_for_send is not None:
+                                if run_content:
+                                    await _send_telegram_message(
+                                        token=telegram_token,
+                                        chat_id=chat_id_for_send,
+                                        text=run_content,
+                                        message_thread_id=thread_id_for_send,
+                                    )
+                                else:
+                                    await _send_telegram_message(
+                                        token=telegram_token,
+                                        chat_id=chat_id_for_send,
+                                        text="Non sono riuscito a generare una risposta testuale dall'immagine.",
+                                        message_thread_id=thread_id_for_send,
+                                    )
+                        except Exception:
+                            logger.exception("image pipeline failed update_id=%s", update_id)
+                            if chat_id_for_send is not None:
+                                await _send_telegram_message(
+                                    token=telegram_token,
+                                    chat_id=chat_id_for_send,
+                                    text="Errore durante la gestione dell'immagine. Riprova con un'altra immagine.",
+                                    message_thread_id=thread_id_for_send,
+                                )
+                        continue
+
+                    # --- Audio ---
+                    preferred_language = _get_user_preferred_language_from_memory(user_id_for_memory)
+                    audio_file_id, audio_kind = _extract_audio_file(message_obj)
+                    if audio_file_id:
+                        try:
+                            transcription = await transcribe_telegram_audio(
+                                token=telegram_token,
+                                file_id=audio_file_id,
+                                update_id=update_id if isinstance(update_id, int) else None,
+                                preferred_language=preferred_language,
+                                logger=logger,
+                            )
+                            quoted_transcript = f'Trascrizione audio:\n"{transcription.transcript}"'
+                            if chat_id_for_send is not None:
+                                await _send_telegram_message(
+                                    token=telegram_token,
+                                    chat_id=chat_id_for_send,
+                                    text=quoted_transcript,
+                                    message_thread_id=thread_id_for_send,
+                                )
+                            logger.info(
+                                "audio transcription done update_id=%s kind=%s lang=%s file=%s local_path=%s",
+                                update_id,
+                                audio_kind,
+                                preferred_language or os.getenv("WHISPER_LANGUAGE", "auto"),
+                                transcription.telegram_file_path,
+                                transcription.local_path,
+                            )
+                            agent_input = (
+                                f"{existing_text}\n\n{quoted_transcript}" if existing_text else quoted_transcript
+                            )
+                            logger.info(
+                                "audio direct-run update_id=%s user_id=%s session_scope=%s input=%s",
+                                update_id,
+                                user_id_for_memory,
+                                session_scope,
+                                _truncate(agent_input, 220),
+                            )
+                            run_kwargs: dict[str, Any] = {
+                                "stream": False,
+                                "user_id": user_id_for_memory,
+                                "add_history_to_context": _bool_env("AUDIO_ADD_HISTORY_TO_CONTEXT", False),
+                            }
+                            if session_scope:
+                                run_kwargs["session_id"] = session_scope
+                            run_output = await agent_context.agent.arun(agent_input, **run_kwargs)
+                            run_status = str(getattr(run_output, "status", ""))
+                            run_content = str(getattr(run_output, "content", "") or "").strip()
+                            logger.info(
+                                "audio direct-run completed update_id=%s status=%s has_content=%s",
+                                update_id,
+                                run_status,
+                                bool(run_content),
+                            )
+                            if chat_id_for_send is not None:
+                                if run_content:
+                                    await _send_telegram_message(
+                                        token=telegram_token,
+                                        chat_id=chat_id_for_send,
+                                        text=run_content,
+                                        message_thread_id=thread_id_for_send,
+                                    )
+                                else:
+                                    await _send_telegram_message(
+                                        token=telegram_token,
+                                        chat_id=chat_id_for_send,
+                                        text="Non sono riuscito a generare una risposta testuale. Riprova con una domanda piu' specifica.",
+                                        message_thread_id=thread_id_for_send,
+                                    )
+                        except Exception:
+                            logger.exception("audio pipeline failed update_id=%s", update_id)
+                            if chat_id_for_send is not None:
+                                await _send_telegram_message(
+                                    token=telegram_token,
+                                    chat_id=chat_id_for_send,
+                                    text="Errore durante la gestione dell'audio. Riprova con un nuovo vocale.",
+                                    message_thread_id=thread_id_for_send,
+                                )
+                        continue
+
+                    # --- Text (direct run, consistent with audio/image) ---
+                    if not existing_text:
+                        continue
+                    logger.info(
+                        "text direct-run update_id=%s user_id=%s session_scope=%s text=%s",
+                        update_id,
+                        user_id_for_memory,
+                        session_scope,
+                        _truncate(existing_text),
+                    )
+                    try:
                         run_kwargs: dict[str, Any] = {
                             "stream": False,
                             "user_id": user_id_for_memory,
-                            "add_history_to_context": _bool_env("IMAGE_ADD_HISTORY_TO_CONTEXT", False),
-                            "images": [Image(content=processed_image.image_bytes)],
-                        }
-                        if session_scope_for_media:
-                            run_kwargs["session_id"] = session_scope_for_media
-
-                        image_context_token = set_current_run_image_for_tools(
-                            image_bytes=processed_image.image_bytes,
-                            local_path=processed_image.local_path,
-                            telegram_file_path=processed_image.telegram_file_path,
-                            user_id=user_id_for_memory,
-                            session_id=session_scope_for_media,
-                        )
-                        try:
-                            run_output = await agent_context.agent.arun(image_prompt, **run_kwargs)
-                        finally:
-                            reset_current_run_image_for_tools(image_context_token)
-                        run_status = str(getattr(run_output, "status", ""))
-                        run_content = str(getattr(run_output, "content", "") or "").strip()
-                        logger.info(
-                            "image direct-run completed update_id=%s status=%s has_content=%s",
-                            update_id,
-                            run_status,
-                            bool(run_content),
-                        )
-
-                        if chat_id_for_send is not None:
-                            if run_content:
-                                await _send_telegram_message(
-                                    token=telegram_token,
-                                    chat_id=chat_id_for_send,
-                                    text=run_content,
-                                    message_thread_id=thread_id_for_send,
-                                )
-                            else:
-                                await _send_telegram_message(
-                                    token=telegram_token,
-                                    chat_id=chat_id_for_send,
-                                    text="Non sono riuscito a generare una risposta testuale dall'immagine.",
-                                    message_thread_id=thread_id_for_send,
-                                )
-                    except Exception:
-                        logger.exception("image pipeline failed update_id=%s", update_id)
-                        if chat_id_for_send is not None:
-                            await _send_telegram_message(
-                                token=telegram_token,
-                                chat_id=chat_id_for_send,
-                                text="Errore durante la gestione dell'immagine. Riprova con un'altra immagine.",
-                                message_thread_id=thread_id_for_send,
-                            )
-                    continue
-
-                preferred_language = _get_user_preferred_language_from_memory(user_id_for_memory)
-                audio_file_id, audio_kind = _extract_audio_file(message_obj)
-                if audio_file_id:
-                    try:
-                        transcription = await transcribe_telegram_audio(
-                            token=telegram_token,
-                            file_id=audio_file_id,
-                            update_id=update_id if isinstance(update_id, int) else None,
-                            preferred_language=preferred_language,
-                            logger=logger,
-                        )
-                        quoted_transcript = f'Trascrizione audio:\n"{transcription.transcript}"'
-
-                        if chat_id_for_send is not None:
-                            await _send_telegram_message(
-                                token=telegram_token,
-                                chat_id=chat_id_for_send,
-                                text=quoted_transcript,
-                                message_thread_id=thread_id_for_send,
-                            )
-
-                        logger.info(
-                            "audio transcription done update_id=%s kind=%s lang=%s file=%s local_path=%s",
-                            update_id,
-                            audio_kind,
-                            preferred_language or os.getenv("WHISPER_LANGUAGE", "auto"),
-                            transcription.telegram_file_path,
-                            transcription.local_path,
-                        )
-
-                        # For audio updates we run the agent directly.
-                        # This avoids webhook/history-media side effects that can produce empty replies.
-                        user_id = user_id_for_memory
-                        chat_id = chat_id_for_scope
-                        thread_id = thread_id_for_scope
-                        session_scope = session_scope_for_media
-                        agent_input = (
-                            f"{existing_text}\n\n{quoted_transcript}" if existing_text else quoted_transcript
-                        )
-                        logger.info(
-                            "audio direct-run update_id=%s user_id=%s session_scope=%s input=%s",
-                            update_id,
-                            user_id,
-                            session_scope,
-                            _truncate(agent_input, 220),
-                        )
-
-                        run_kwargs: dict[str, Any] = {
-                            "stream": False,
-                            "user_id": user_id,
-                            "add_history_to_context": _bool_env("AUDIO_ADD_HISTORY_TO_CONTEXT", False),
                         }
                         if session_scope:
                             run_kwargs["session_id"] = session_scope
-
-                        run_output = await agent_context.agent.arun(agent_input, **run_kwargs)
-                        run_status = str(getattr(run_output, "status", ""))
+                        run_output = await agent_context.agent.arun(existing_text, **run_kwargs)
                         run_content = str(getattr(run_output, "content", "") or "").strip()
-
-                        logger.info(
-                            "audio direct-run completed update_id=%s status=%s has_content=%s",
-                            update_id,
-                            run_status,
-                            bool(run_content),
-                        )
-
                         if chat_id_for_send is not None:
                             if run_content:
                                 await _send_telegram_message(
@@ -571,91 +811,28 @@ async def run_telegram_polling_loop() -> None:
                                 await _send_telegram_message(
                                     token=telegram_token,
                                     chat_id=chat_id_for_send,
-                                    text="Non sono riuscito a generare una risposta testuale. Riprova con una domanda piu' specifica.",
+                                    text="Non sono riuscito a generare una risposta. Riprova.",
                                     message_thread_id=thread_id_for_send,
                                 )
-
-                        # Audio update handled end-to-end: skip webhook forward.
-                        continue
+                    except asyncio.CancelledError:
+                        raise
                     except Exception:
-                        logger.exception("audio pipeline failed update_id=%s", update_id)
-                        chat_id_for_send = (message_obj.get("chat") or {}).get("id")
-                        thread_id_for_send = message_obj.get("message_thread_id")
+                        logger.exception("text direct-run failed update_id=%s", update_id)
                         if chat_id_for_send is not None:
                             await _send_telegram_message(
                                 token=telegram_token,
                                 chat_id=chat_id_for_send,
-                                text="Errore durante la gestione dell'audio. Riprova con un nuovo vocale.",
+                                text="Si è verificato un errore. Riprova.",
                                 message_thread_id=thread_id_for_send,
                             )
-                        continue
 
-                user_id, chat_id, thread_id, text = _extract_update_identity(update)
-                session_scope = _build_session_scope(agent_id, chat_id, thread_id)
-                logger.info(
-                    "telegram update_id=%s user_id=%s session_scope=%s text=%s",
-                    update_id,
-                    user_id,
-                    session_scope,
-                    _truncate(text),
-                )
-
-                webhook_headers: dict[str, str] = {}
-                webhook_secret = os.getenv("TELEGRAM_WEBHOOK_SECRET_TOKEN", "").strip()
-                if webhook_secret:
-                    webhook_headers["X-Telegram-Bot-Api-Secret-Token"] = webhook_secret
-
-                try:
-                    local_response = await local_client.post(
-                        local_webhook_url,
-                        json=update,
-                        headers=webhook_headers or None,
-                    )
-                    webhook_status = ""
-                    response_text = local_response.text
-                    try:
-                        local_payload = local_response.json()
-                        webhook_status = str(local_payload.get("status", ""))
-                    except Exception:
-                        local_payload = {}
-                        webhook_status = ""
-
-                    logger.info(
-                        "forwarded polled update_id=%s to /telegram/webhook status=%s webhook_status=%s body=%s",
-                        update_id,
-                        local_response.status_code,
-                        webhook_status,
-                        _truncate(response_text, 220),
-                    )
-
-                    # Fallback path for audio messages when webhook route ignores/rejects the update.
-                    if audio_file_id and (
-                        local_response.status_code != 200 or webhook_status in {"ignored", "", "error"}
-                    ):
-                        logger.warning(
-                            "webhook did not process transcribed audio update_id=%s; using direct agent fallback",
-                            update_id,
-                        )
-                        if text and user_id and chat_id:
-                            try:
-                                run_kwargs: dict[str, Any] = {"stream": False, "user_id": user_id}
-                                if session_scope:
-                                    run_kwargs["session_id"] = session_scope
-                                run_output = await agent_context.agent.arun(text, **run_kwargs)
-                                content = str(getattr(run_output, "content", "") or "").strip()
-                                if content:
-                                    await _send_telegram_message(
-                                        token=telegram_token,
-                                        chat_id=chat_id,
-                                        text=content,
-                                        message_thread_id=thread_id,
-                                    )
-                            except Exception:
-                                logger.exception("direct agent fallback failed update_id=%s", update_id)
                 except asyncio.CancelledError:
                     raise
                 except Exception:
-                    logger.exception("failed forwarding update_id=%s to local webhook", update_id)
+                    logger.exception("update processing failed update_id=%s", update_id)
+                finally:
+                    reset_current_requester_email(requester_email_token)
+                    reset_current_run_attachment_for_tools(attachment_token)
 
 
 async def startup_diagnostics() -> None:

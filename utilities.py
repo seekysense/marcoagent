@@ -56,6 +56,14 @@ class AudioTranscriptionResult:
 
 
 @dataclass(frozen=True)
+class FileDownloadResult:
+    file_bytes: bytes
+    filename: str
+    local_path: str
+    telegram_file_path: str
+
+
+@dataclass(frozen=True)
 class ImagePreprocessResult:
     image_bytes: bytes
     local_path: str
@@ -363,6 +371,31 @@ def _preprocess_image_sync(local_path: Path, max_dim: int, jpeg_quality: int) ->
         buffer = BytesIO()
         img.save(buffer, format="JPEG", quality=jpeg_quality, optimize=True)
         return buffer.getvalue(), original_width, original_height, output_width, output_height
+
+
+async def download_telegram_document(
+    token: str,
+    file_id: str,
+    filename: str,
+    update_id: int | None,
+    logger=None,
+) -> FileDownloadResult:
+    temp_dir = _resolve_temp_dir(_get_transit_temp_dir("transit"), logger=logger)
+    local_path, telegram_file_path = await _download_telegram_file(
+        token=token,
+        file_id=file_id,
+        update_id=update_id,
+        temp_dir=temp_dir,
+        prefix="doc",
+        logger=logger,
+    )
+    file_bytes = local_path.read_bytes()
+    return FileDownloadResult(
+        file_bytes=file_bytes,
+        filename=filename or local_path.name,
+        local_path=str(local_path),
+        telegram_file_path=telegram_file_path,
+    )
 
 
 async def transcribe_telegram_audio(

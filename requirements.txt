@@ -9,3 +9,5 @@ openai-whisper>=20240930
 Pillow>=10.0.0
 requests>=2.32.0
 beautifulsoup4>=4.12.0
+streamlit 
+pandas
