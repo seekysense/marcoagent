@@ -114,7 +114,8 @@ CASTELLETTO_API_ANALYZE_TOOL_PROMPT = (
     "  tc_kitchen_cabinet  → armadio/dispensa cucina (Nexocab)\n"
     "  tc_lobby            → lobby/reception\n"
     "  tc_parking_01       → parcheggio esterno\n"
-    "  tc_patio            → patio/area esterna\n\n"
+    "  tc_patio            → patio/area esterna\n"
+    "  tc_lockers          → armadietti (lockers)\n\n"
     "AZIONI DISPONIBILI e campi JSON ritornati:\n"
     "  people_count                  → persone presenti; {number:int, confidence:float, describe:str}\n"
     "  vehicle_count                 → veicoli presenti; {number:int, confidence:float, describe:str}\n"
@@ -149,6 +150,7 @@ _CASTELLETTO_CAMERA_LABELS: dict[str, str] = {
     "tc_lobby": "lobby/reception",
     "tc_parking_01": "parcheggio",
     "tc_patio": "patio",
+    "tc_lockers": "armadietti (lockers)",
 }
 
 
