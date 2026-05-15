@@ -92,6 +92,7 @@ env.bak/
 venv.bak/
 
 *.md
+!readme.md
 !README.md
 
 .claude/

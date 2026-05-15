@@ -72,6 +72,8 @@ def _agent_operational_instructions() -> list[str]:
             "e l'azione più appropriate. "
             "Per analisi su finestre temporali di video (es. 'qualcuno ha aperto l'armadio?', 'cosa è successo alle 10:30?') "
             "usa `castelletto_run_sequence` con camera_id, sequence_id e opzionalmente l'orario nel campo 'at'. "
+            "Se l'utente chiede se qualcosa è stato preso dagli armadietti (o lockers, piano -1), "
+            "usa `castelletto_run_sequence` con camera_id='tc_lockers' e sequence_id='lockers_access_detection'. "
             "Usa `castelletto_list_actions` o `castelletto_list_sequences` se non sei sicuro di quali azioni/sequenze esistono. "
             "Rispondi sempre in italiano con un'interpretazione naturale del risultato."
         ),

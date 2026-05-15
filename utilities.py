@@ -1,58 +1,12 @@
 import asyncio
 import os
 import re
-import threading
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
 from typing import Any
 
 import httpx
-
-_WHISPER_MODEL_CACHE: dict[str, Any] = {}
-_WHISPER_MODEL_LOCK = threading.Lock()
-_LANGUAGE_ALIASES: dict[str, str] = {
-    "it": "it",
-    "italian": "it",
-    "italiano": "it",
-    "en": "en",
-    "english": "en",
-    "inglese": "en",
-    "fr": "fr",
-    "french": "fr",
-    "francese": "fr",
-    "es": "es",
-    "spanish": "es",
-    "spagnolo": "es",
-    "de": "de",
-    "german": "de",
-    "tedesco": "de",
-    "pt": "pt",
-    "portuguese": "pt",
-    "portoghese": "pt",
-    "ru": "ru",
-    "russian": "ru",
-    "russo": "ru",
-    "ar": "ar",
-    "arabic": "ar",
-    "arabo": "ar",
-    "zh": "zh",
-    "chinese": "zh",
-    "cinese": "zh",
-    "ja": "ja",
-    "japanese": "ja",
-    "giapponese": "ja",
-    "ko": "ko",
-    "korean": "ko",
-    "coreano": "ko",
-}
-
-
-@dataclass(frozen=True)
-class AudioTranscriptionResult:
-    transcript: str
-    local_path: str
-    telegram_file_path: str
 
 
 @dataclass(frozen=True)
@@ -253,15 +207,6 @@ def _get_transit_temp_dir(kind: str) -> str:
     return default_dir
 
 
-def normalize_whisper_language(value: str | None) -> str | None:
-    if not value:
-        return None
-    raw = value.strip().lower()
-    if not raw:
-        return None
-    return _LANGUAGE_ALIASES.get(raw, raw)
-
-
 def _get_int_env(name: str, default: int, min_value: int, max_value: int) -> int:
     raw = (os.getenv(name) or "").strip()
     if not raw:
@@ -271,38 +216,6 @@ def _get_int_env(name: str, default: int, min_value: int, max_value: int) -> int
     except ValueError:
         return default
     return max(min_value, min(max_value, value))
-
-
-def _load_whisper_model(model_name: str, logger):
-    with _WHISPER_MODEL_LOCK:
-        if model_name in _WHISPER_MODEL_CACHE:
-            return _WHISPER_MODEL_CACHE[model_name]
-
-        try:
-            import whisper  # type: ignore
-        except Exception as exc:  # pragma: no cover
-            raise RuntimeError(
-                "Whisper non disponibile. Installa dipendenze con `pip install -r requirements.txt`"
-            ) from exc
-
-        if logger:
-            logger.info("loading local whisper model=%s", model_name)
-        model = whisper.load_model(model_name)
-        _WHISPER_MODEL_CACHE[model_name] = model
-        return model
-
-
-def _transcribe_sync(audio_path: Path, model_name: str, language: str | None, logger) -> str:
-    model = _load_whisper_model(model_name=model_name, logger=logger)
-    kwargs: dict[str, Any] = {"fp16": False}
-    if language:
-        kwargs["language"] = language
-
-    result = model.transcribe(str(audio_path), **kwargs)
-    transcript = str(result.get("text", "")).strip()
-    if not transcript:
-        raise RuntimeError("Trascrizione vuota")
-    return transcript
 
 
 async def _download_telegram_file(
@@ -393,43 +306,6 @@ async def download_telegram_document(
     return FileDownloadResult(
         file_bytes=file_bytes,
         filename=filename or local_path.name,
-        local_path=str(local_path),
-        telegram_file_path=telegram_file_path,
-    )
-
-
-async def transcribe_telegram_audio(
-    token: str,
-    file_id: str,
-    update_id: int | None,
-    preferred_language: str | None = None,
-    logger=None,
-) -> AudioTranscriptionResult:
-    temp_dir = _resolve_temp_dir(_get_transit_temp_dir("audio"), logger=logger)
-    whisper_model = os.getenv("WHISPER_MODEL", "base").strip() or "base"
-    memory_language = normalize_whisper_language(preferred_language)
-    env_language = normalize_whisper_language((os.getenv("WHISPER_LANGUAGE") or "").strip() or None)
-    whisper_language = memory_language or env_language
-
-    local_path, telegram_file_path = await _download_telegram_file(
-        token=token,
-        file_id=file_id,
-        update_id=update_id,
-        temp_dir=temp_dir,
-        prefix="audio",
-        logger=logger,
-    )
-
-    transcript = await asyncio.to_thread(
-        _transcribe_sync,
-        local_path,
-        whisper_model,
-        whisper_language,
-        logger,
-    )
-
-    return AudioTranscriptionResult(
-        transcript=transcript,
         local_path=str(local_path),
         telegram_file_path=telegram_file_path,
     )

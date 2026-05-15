@@ -1,0 +1,28 @@
+.git/
+.gitignore
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Runtime data — mounted as volume at /data
+memory.sqllite
+temp/
+
+# Secrets — passed at runtime with --env-file
+.env
+
+# Dev/test artifacts
+audio.mp3
+*.md
+.claude/
+agent-selector.js
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store

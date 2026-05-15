@@ -19,9 +19,7 @@ from storage_data import get_user_by_telegram_id, register_user_from_contact
 from utilities import (
     download_telegram_document,
     markdown_to_telegram_payload,
-    normalize_whisper_language,
     preprocess_telegram_image_for_llm,
-    transcribe_telegram_audio,
 )
 
 LOCAL_HOST = "127.0.0.1"
@@ -138,70 +136,6 @@ def _build_session_scope(entity_id: str, chat_id: str | None, thread_id: str | N
     if thread_id:
         return f"tg:{entity_id}:{chat_id}:{thread_id}"
     return f"tg:{entity_id}:{chat_id}"
-
-
-_MEMORY_LANGUAGE_HINTS: dict[str, tuple[str, ...]] = {
-    "it": ("italiano", "italian", "italiana", "italiani"),
-    "en": ("inglese", "english"),
-    "fr": ("francese", "french"),
-    "es": ("spagnolo", "spanish"),
-    "de": ("tedesco", "german"),
-    "pt": ("portoghese", "portuguese"),
-}
-
-
-def _get_user_preferred_language_from_memory(user_id: str | None) -> str | None:
-    if not user_id or not _bool_env("WHISPER_USE_MEMORY_LANGUAGE", True):
-        return None
-
-    try:
-        memories = agent_context.agent.get_user_memories(user_id=user_id) or []
-    except Exception:
-        logger.exception("unable to load user memories for language preference user_id=%s", user_id)
-        return None
-
-    if not memories:
-        return None
-
-    sorted_memories = sorted(memories, key=lambda m: getattr(m, "updated_at", 0) or 0, reverse=True)
-    for memory in sorted_memories:
-        parts: list[str] = []
-        parts.append(str(getattr(memory, "memory", "") or ""))
-        parts.append(str(getattr(memory, "input", "") or ""))
-        topics = getattr(memory, "topics", None)
-        if isinstance(topics, list):
-            parts.extend(str(topic) for topic in topics)
-
-        text = " ".join(parts).lower()
-        if not text:
-            continue
-
-        # explicit code patterns like "lingua: it" or "language=en"
-        code_match = re.search(r"\b(?:lingua|language|lang)\s*[:=]?\s*([a-z]{2})\b", text)
-        if code_match:
-            code = normalize_whisper_language(code_match.group(1))
-            if code:
-                logger.info("memory language detected user_id=%s lang=%s", user_id, code)
-                return code
-
-        for code, hints in _MEMORY_LANGUAGE_HINTS.items():
-            if any(hint in text for hint in hints):
-                logger.info("memory language detected user_id=%s lang=%s", user_id, code)
-                return code
-
-    return None
-
-
-def _extract_audio_file(message: dict[str, Any]) -> tuple[str | None, str | None]:
-    voice = message.get("voice")
-    if isinstance(voice, dict) and voice.get("file_id"):
-        return str(voice["file_id"]), "voice"
-
-    audio = message.get("audio")
-    if isinstance(audio, dict) and audio.get("file_id"):
-        return str(audio["file_id"]), "audio"
-
-    return None, None
 
 
 def _extract_photo_file_id(message: dict[str, Any]) -> str | None:
@@ -388,6 +322,7 @@ agent_os = AgentOS(
     scheduler=True,
     scheduler_poll_interval=int(os.getenv("SCHEDULER_POLL_INTERVAL", "60")),
     scheduler_base_url=_scheduler_base_url,
+    telemetry=False,
 )
 app = agent_os.get_app()
 
@@ -720,85 +655,16 @@ async def run_telegram_polling_loop() -> None:
                         continue
 
                     # --- Audio ---
-                    preferred_language = _get_user_preferred_language_from_memory(user_id_for_memory)
-                    audio_file_id, audio_kind = _extract_audio_file(message_obj)
+                    audio_file_id = (message_obj.get("voice") or {}).get("file_id") or (message_obj.get("audio") or {}).get("file_id")
                     if audio_file_id:
-                        try:
-                            transcription = await transcribe_telegram_audio(
+                        logger.info("audio message received update_id=%s, rejecting", update_id)
+                        if chat_id_for_send is not None:
+                            await _send_telegram_message(
                                 token=telegram_token,
-                                file_id=audio_file_id,
-                                update_id=update_id if isinstance(update_id, int) else None,
-                                preferred_language=preferred_language,
-                                logger=logger,
+                                chat_id=chat_id_for_send,
+                                text="Mandami solo del testo, usa il tuo device per dettare, grazie",
+                                message_thread_id=thread_id_for_send,
                             )
-                            quoted_transcript = f'Trascrizione audio:\n"{transcription.transcript}"'
-                            if chat_id_for_send is not None:
-                                await _send_telegram_message(
-                                    token=telegram_token,
-                                    chat_id=chat_id_for_send,
-                                    text=quoted_transcript,
-                                    message_thread_id=thread_id_for_send,
-                                )
-                            logger.info(
-                                "audio transcription done update_id=%s kind=%s lang=%s file=%s local_path=%s",
-                                update_id,
-                                audio_kind,
-                                preferred_language or os.getenv("WHISPER_LANGUAGE", "auto"),
-                                transcription.telegram_file_path,
-                                transcription.local_path,
-                            )
-                            agent_input = (
-                                f"{existing_text}\n\n{quoted_transcript}" if existing_text else quoted_transcript
-                            )
-                            logger.info(
-                                "[LLM] arun start  update_id=%s user_id=%s kind=audio input=%s",
-                                update_id,
-                                user_id_for_memory,
-                                _truncate(agent_input, 220),
-                            )
-                            run_kwargs: dict[str, Any] = {
-                                "stream": False,
-                                "user_id": user_id_for_memory,
-                                "add_history_to_context": _bool_env("AUDIO_ADD_HISTORY_TO_CONTEXT", False),
-                            }
-                            if session_scope:
-                                run_kwargs["session_id"] = session_scope
-                            set_current_caller_telegram_id(user_id_for_memory)
-                            _arun_t0 = time.perf_counter()
-                            run_output = await agent_context.agent.arun(agent_input, **run_kwargs)
-                            run_status = str(getattr(run_output, "status", ""))
-                            run_content = str(getattr(run_output, "content", "") or "").strip()
-                            logger.info(
-                                "[LLM] arun done   update_id=%s  %.1fs  status=%s  has_content=%s",
-                                update_id,
-                                time.perf_counter() - _arun_t0,
-                                run_status,
-                                bool(run_content),
-                            )
-                            if chat_id_for_send is not None:
-                                if run_content:
-                                    await _send_telegram_message(
-                                        token=telegram_token,
-                                        chat_id=chat_id_for_send,
-                                        text=run_content,
-                                        message_thread_id=thread_id_for_send,
-                                    )
-                                else:
-                                    await _send_telegram_message(
-                                        token=telegram_token,
-                                        chat_id=chat_id_for_send,
-                                        text="Non sono riuscito a generare una risposta testuale. Riprova con una domanda piu' specifica.",
-                                        message_thread_id=thread_id_for_send,
-                                    )
-                        except Exception:
-                            logger.exception("audio pipeline failed update_id=%s", update_id)
-                            if chat_id_for_send is not None:
-                                await _send_telegram_message(
-                                    token=telegram_token,
-                                    chat_id=chat_id_for_send,
-                                    text="Errore durante la gestione dell'audio. Riprova con un nuovo vocale.",
-                                    message_thread_id=thread_id_for_send,
-                                )
                         continue
 
                     # --- Text (direct run, consistent with audio/image) ---
@@ -887,14 +753,6 @@ async def startup_diagnostics() -> None:
         "scheduler enabled base_url=%s poll_interval=%ss",
         _scheduler_base_url,
         os.getenv("SCHEDULER_POLL_INTERVAL", "60"),
-    )
-    logger.info(
-        "audio transcription enabled whisper_model=%s whisper_language=%s audio_temp_dir=%s prefer_memory_language=%s audio_add_history_to_context=%s",
-        os.getenv("WHISPER_MODEL", "base"),
-        os.getenv("WHISPER_LANGUAGE", "auto"),
-        _get_effective_temp_dir("AUDIO_TEMP_DIR"),
-        _bool_env("WHISPER_USE_MEMORY_LANGUAGE", True),
-        _bool_env("AUDIO_ADD_HISTORY_TO_CONTEXT", False),
     )
     logger.info(
         "image preprocessing enabled max_dim=%s jpeg_quality=%s image_temp_dir=%s image_add_history_to_context=%s",
