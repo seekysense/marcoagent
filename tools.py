@@ -136,6 +136,8 @@ CASTELLETTO_API_ANALYZE_TOOL_PROMPT = (
     "  'pulizie esterne / patio'               → camera=tc_patio, action=outdoor_maintenance_detection, at=''\n"
     "  'com'è il patio?'                       → camera=tc_patio, action=patio_check, at=''\n"
     "  'qualcuno in reception/lobby?'          → camera=tc_lobby, action=people_count, at=''\n\n"
+    "  'qualcuno davanti ai lockers?'          → camera=tc_lockers, action=people_count, at=''\n\n"
+    "  'c'è un cane in cucina?'                → camera=tc_kitchen, action=dog_detection, at=''\n\n"
     "RISPOSTA ALL'UTENTE:\n"
     "  - Rispondi in italiano colloquiale, come se stessi descrivendo quello che vedi\n"
     "  - NON riportare valori tecnici (confidence, number, boolean, campi JSON, nomi dei campi)\n"
