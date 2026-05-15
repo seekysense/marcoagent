@@ -1,0 +1,21 @@
+services:
+  marco-agent:
+    build: .
+    env_file: .env
+    environment:
+      # Override path vars from .env to use the persistent volume inside the container
+      AGNO_MEMORY_DB_FILE: /data/memory.sqllite
+      TRANSIT_TEMP_DIR: /data/temp
+      IMAGE_TEMP_DIR: /data/temp
+    volumes:
+      - marco-agent-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:7777/health"]
+      interval: 30s
+      timeout: 10s
+      start_period: 20s
+      retries: 3
+
+volumes:
+  marco-agent-data:
