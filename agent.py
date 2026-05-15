@@ -67,30 +67,45 @@ def _memory_additional_instructions() -> str | None:
 def _agent_operational_instructions() -> list[str]:
     return [
         (
-            "Per richieste di approvazione acquisto/sostituzione/servizi a pagamento usa il tool "
-            "`create_sharepoint_approval_task`."
-        ),
-        (
-            "Se la richiesta fa riferimento a una foto inviata dall'utente, usa prima `describe_image` "
-            "e poi inserisci nel `context_summary` i dettagli salienti emersi dalla foto insieme a un "
-            "suggerimento operativo su come proseguire il task. Se l'utente chiede solo di allegarla, non descrivere l'immagine o il file."
-        ),
-        (
-            "Per recuperare lo stato delle richieste, task o approvazioni dell'utente usa il tool `get_task_status`."
-        ),
-        (
-            "Se l'utente invia un file (documento o immagine) e chiede di allegarlo a un task, "
-            "usa il tool `add_task_attachment` specificando l'ID del task. "
-            "Se l'ID non è presente nel messaggio o nel contesto, chiedilo all'utente prima di procedere."
-        ),
-        (
             "Per domande sulla situazione attuale dell'hotel The Castelletto (es. colazione, parcheggio, pulizie, presenze "
             "in cucina/lobby/patio/ingresso) usa il tool `castelletto_camera_analyze` scegliendo la telecamera "
-            "e l'azione più appropriate. Rispondi sempre in italiano con un'interpretazione naturale del risultato."
+            "e l'azione più appropriate. "
+            "Per analisi su finestre temporali di video (es. 'qualcuno ha aperto l'armadio?', 'cosa è successo alle 10:30?') "
+            "usa `castelletto_run_sequence` con camera_id, sequence_id e opzionalmente l'orario nel campo 'at'. "
+            "Usa `castelletto_list_actions` o `castelletto_list_sequences` se non sei sicuro di quali azioni/sequenze esistono. "
+            "Rispondi sempre in italiano con un'interpretazione naturale del risultato."
+        ),
+        (
+            "Per domande sulle prenotazioni dell'hotel The Castelletto (arrivi, partenze, ospiti in struttura, "
+            "pre-checkin, note, animali, camere) usa il tool `pms_get_reservations`. "
+            "Se l'utente non specifica un periodo, chiedi 'per quale giorno o periodo?' prima di chiamare il tool. "
+            "Sii prudente con i dati degli ospiti: non condividere email, telefono o dati personali "
+            "a meno che l'utente non li chieda esplicitamente."
+        ),
+        (
+            "Per creare pro-memoria condizionali usa reminder_create. "
+            "Parametri: name (nome breve univoco), cron_expr (cron 5 campi, timezone Europe/Rome), "
+            "task_description (istruzione completa per il controllo e l'eventuale notifica), "
+            "chat_id (ID Telegram dell'utente da notificare). "
+            "Nella task_description specifica: quale tool usare (es. castelletto_camera_analyze), "
+            "quale azione/telecamera, la condizione da verificare, e di usare send_telegram_message "
+            "con il chat_id se la condizione è soddisfatta. "
+            "Esempi cron (Europe/Rome): '0 7 * * *' ogni giorno alle 7, '15 7 * * 1-5' lun-ven alle 7:15. "
+            "Usa reminder_list per elencare i reminder attivi, reminder_delete per eliminarne uno. "
+            "Durante l'esecuzione di un reminder, usa send_telegram_message SOLO se la condizione è vera."
+        ),
+        (
+            "Per gestire gli utenti del bot usa i tool user_add, user_list, user_delete. "
+            "Questi tool sono riservati agli amministratori: il controllo avviene automaticamente nel tool. "
+            "user_add accetta un numero di cellulare completo (es. +393471234567): "
+            "se l'utente esiste già lo segnala, altrimenti lo crea con ruolo 'user'. "
+            "user_list mostra tutti gli utenti registrati. "
+            "user_delete rimuove un utente per numero di cellulare (gli admin non possono essere eliminati). "
+            "Usa questi tool quando l'utente chiede di aggiungere, elencare o rimuovere utenti dal bot."
         ),
         (
             "Rispondi sempre in modo conciso e operativo, evitando di essere prolisso o di ripetere informazioni già presenti nella memoria. "
-            "Usa sempre la stessa lingua della richiesta dell'utente (italiano o inglese) e non tradurre mai le parole chiave dei tool (es. `create_sharepoint_approval_task`, `describe_image`, `get_task_status`) in italiano."
+            "Usa sempre la stessa lingua della richiesta dell'utente (italiano o inglese)."
         ),
     ]
 
@@ -102,6 +117,7 @@ class AgentContext:
     llm_endpoint: str
     llm_model: str
     db_file: str
+    db: SqliteDb
     memory_capture_instructions: str
     memory_additional_instructions: str | None
     skills_dir: str | None
@@ -140,11 +156,14 @@ def build_agent_context() -> AgentContext:
     memory_additional_instructions = _memory_additional_instructions()
     skills, skills_dir, skill_names = _build_skills()
 
+    _llm_timeout = int(os.getenv("LLM_TIMEOUT_SECONDS", "120"))
+
     memory_manager = MemoryManager(
         model=OpenAILike(
             id=llm_model,
             api_key=llm_api_key,
             base_url=base_url,
+            timeout=_llm_timeout,
         ),
         memory_capture_instructions=memory_capture_instructions,
         additional_instructions=memory_additional_instructions,
@@ -158,6 +177,7 @@ def build_agent_context() -> AgentContext:
             id=llm_model,
             api_key=llm_api_key,
             base_url=base_url,
+            timeout=_llm_timeout,
         ),
         instructions=_agent_operational_instructions(),
         skills=skills,
@@ -180,6 +200,7 @@ def build_agent_context() -> AgentContext:
         llm_endpoint=llm_endpoint,
         llm_model=llm_model,
         db_file=db_file,
+        db=db,
         memory_capture_instructions=memory_capture_instructions,
         memory_additional_instructions=memory_additional_instructions,
         skills_dir=skills_dir,

@@ -11,18 +11,11 @@ import httpx
 from dotenv import load_dotenv
 
 from agent import AgentContext, build_agent_context, require_env
+from tools import set_current_caller_telegram_id
 from agno.media import Image
 from agno.os.app import AgentOS
 from agno.os.interfaces.telegram import Telegram
 from storage_data import get_user_by_telegram_id, register_user_from_contact
-from tools import (
-    reset_current_requester_email,
-    reset_current_run_attachment_for_tools,
-    reset_current_run_image_for_tools,
-    set_current_requester_email,
-    set_current_run_attachment_for_tools,
-    set_current_run_image_for_tools,
-)
 from utilities import (
     download_telegram_document,
     markdown_to_telegram_payload,
@@ -54,18 +47,50 @@ def _mask_secret(secret: str, visible_chars: int = 4) -> str:
     return f"{secret[:visible_chars]}...{secret[-visible_chars:]}"
 
 
+class _AgnoSchedulerPollFilter(logging.Filter):
+    """Suppresses the transient 404 noise produced by Agno's ScheduleExecutor.
+
+    When a scheduled run is in-flight, the executor polls GET /runs/{run_id}
+    immediately (no sleep on 404) and the AgentOS logs a WARNING + ERROR for
+    each poll that hits while the agent is still running. These messages are
+    expected and not actionable — the run completes correctly on the next poll.
+    """
+
+    _PATTERNS = (
+        re.compile(r"RunOutput .+ not found in Session"),
+        re.compile(r"HTTP exception: 404 Run not found"),
+    )
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        msg = record.getMessage()
+        return not any(p.search(msg) for p in self._PATTERNS)
+
+
 def _configure_logging() -> logging.Logger:
     log_level = os.getenv("LOG_LEVEL", "INFO").upper()
     level = getattr(logging, log_level, logging.INFO)
+    formatter = logging.Formatter("%(asctime)s %(levelname)s %(name)s | %(message)s")
+
     logger_instance = logging.getLogger("telegram_bot")
     logger_instance.setLevel(level)
-
     if not logger_instance.handlers:
         handler = logging.StreamHandler()
-        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s | %(message)s"))
+        handler.setFormatter(formatter)
         logger_instance.addHandler(handler)
-
     logger_instance.propagate = False
+
+    # Suppress transient 404 polling noise from Agno's scheduler executor
+    agno_logger = logging.getLogger("agno")
+    agno_logger.addFilter(_AgnoSchedulerPollFilter())
+
+    tools_logger = logging.getLogger("marco.tools")
+    tools_logger.setLevel(level)
+    if not tools_logger.handlers:
+        handler = logging.StreamHandler()
+        handler.setFormatter(formatter)
+        tools_logger.addHandler(handler)
+    tools_logger.propagate = False
+
     return logger_instance
 
 
@@ -272,6 +297,9 @@ def _normalize_phone(phone: str) -> str:
         return phone
     if phone.startswith("00"):
         return "+" + phone[2:]
+    # Number already contains Italian country code but without leading +
+    if phone.startswith("39") and len(phone) >= 11:
+        return "+" + phone
     return "+39" + phone
 
 
@@ -345,6 +373,8 @@ agent_id = agent_context.agent_id
 # Accept the typo already present in the current .env for compatibility.
 telegram_token = require_env("TELEGRAM_TOKEN", "TELEGHRAM_BOT_TOKEN")
 
+_scheduler_base_url = f"http://127.0.0.1:{_get_port()}"
+
 agent_os = AgentOS(
     agents=[agent_context.agent],
     interfaces=[
@@ -354,6 +384,10 @@ agent_os = AgentOS(
             streaming=_bool_env("TELEGRAM_STREAMING", True),
         )
     ],
+    db=agent_context.db,
+    scheduler=True,
+    scheduler_poll_interval=int(os.getenv("SCHEDULER_POLL_INTERVAL", "60")),
+    scheduler_base_url=_scheduler_base_url,
 )
 app = agent_os.get_app()
 
@@ -548,6 +582,10 @@ async def run_telegram_polling_loop() -> None:
                         )
                         continue
 
+                # --- Skip /start ---
+                if existing_text.lower().startswith("/start"):
+                    continue
+
                 # --- Immediate feedback ---
                 if chat_id_for_send is not None:
                     await _send_telegram_message(
@@ -557,9 +595,6 @@ async def run_telegram_polling_loop() -> None:
                         message_thread_id=thread_id_for_send,
                     )
 
-                user_email = (user_record.get("email") or "").strip() if user_record else None
-                requester_email_token = set_current_requester_email(user_email or None)
-                attachment_token = set_current_run_attachment_for_tools(b"", "")
                 try:
                     # --- Document ---
                     doc_file_id, doc_filename, doc_mime_type = _extract_document(message_obj)
@@ -571,11 +606,6 @@ async def run_telegram_polling_loop() -> None:
                                 filename=doc_filename,
                                 update_id=update_id if isinstance(update_id, int) else None,
                                 logger=logger,
-                            )
-                            attachment_token_inner = set_current_run_attachment_for_tools(
-                                file_bytes=doc_result.file_bytes,
-                                filename=doc_result.filename,
-                                mime_type=doc_mime_type,
                             )
                             logger.info(
                                 "document downloaded update_id=%s filename=%s size=%s",
@@ -594,10 +624,11 @@ async def run_telegram_polling_loop() -> None:
                             }
                             if session_scope:
                                 run_kwargs["session_id"] = session_scope
-                            try:
-                                run_output = await agent_context.agent.arun(agent_input, **run_kwargs)
-                            finally:
-                                reset_current_run_attachment_for_tools(attachment_token_inner)
+                            set_current_caller_telegram_id(user_id_for_memory)
+                            logger.info("[LLM] arun start  update_id=%s user_id=%s kind=document input=%s", update_id, user_id_for_memory, _truncate(agent_input))
+                            _arun_t0 = time.perf_counter()
+                            run_output = await agent_context.agent.arun(agent_input, **run_kwargs)
+                            logger.info("[LLM] arun done   update_id=%s  %.1fs  status=%s", update_id, time.perf_counter() - _arun_t0, getattr(run_output, "status", "?"))
                             run_content = str(getattr(run_output, "content", "") or "").strip()
                             if chat_id_for_send is not None:
                                 await _send_telegram_message(
@@ -627,11 +658,6 @@ async def run_telegram_polling_loop() -> None:
                                 update_id=update_id if isinstance(update_id, int) else None,
                                 logger=logger,
                             )
-                            attachment_token_inner = set_current_run_attachment_for_tools(
-                                file_bytes=processed_image.image_bytes,
-                                filename=f"photo_{update_id or 'x'}.jpg",
-                                mime_type="image/jpeg",
-                            )
                             image_prompt = existing_text or os.getenv(
                                 "IMAGE_DEFAULT_PROMPT",
                                 "Analizza l'immagine e rispondi in modo utile.",
@@ -654,23 +680,16 @@ async def run_telegram_polling_loop() -> None:
                             }
                             if session_scope:
                                 run_kwargs["session_id"] = session_scope
-                            image_context_token = set_current_run_image_for_tools(
-                                image_bytes=processed_image.image_bytes,
-                                local_path=processed_image.local_path,
-                                telegram_file_path=processed_image.telegram_file_path,
-                                user_id=user_id_for_memory,
-                                session_id=session_scope,
-                            )
-                            try:
-                                run_output = await agent_context.agent.arun(image_prompt, **run_kwargs)
-                            finally:
-                                reset_current_run_image_for_tools(image_context_token)
-                                reset_current_run_attachment_for_tools(attachment_token_inner)
+                            set_current_caller_telegram_id(user_id_for_memory)
+                            logger.info("[LLM] arun start  update_id=%s user_id=%s kind=image prompt=%s", update_id, user_id_for_memory, _truncate(image_prompt))
+                            _arun_t0 = time.perf_counter()
+                            run_output = await agent_context.agent.arun(image_prompt, **run_kwargs)
                             run_status = str(getattr(run_output, "status", ""))
                             run_content = str(getattr(run_output, "content", "") or "").strip()
                             logger.info(
-                                "image direct-run completed update_id=%s status=%s has_content=%s",
+                                "[LLM] arun done   update_id=%s  %.1fs  status=%s  has_content=%s",
                                 update_id,
+                                time.perf_counter() - _arun_t0,
                                 run_status,
                                 bool(run_content),
                             )
@@ -732,10 +751,9 @@ async def run_telegram_polling_loop() -> None:
                                 f"{existing_text}\n\n{quoted_transcript}" if existing_text else quoted_transcript
                             )
                             logger.info(
-                                "audio direct-run update_id=%s user_id=%s session_scope=%s input=%s",
+                                "[LLM] arun start  update_id=%s user_id=%s kind=audio input=%s",
                                 update_id,
                                 user_id_for_memory,
-                                session_scope,
                                 _truncate(agent_input, 220),
                             )
                             run_kwargs: dict[str, Any] = {
@@ -745,12 +763,15 @@ async def run_telegram_polling_loop() -> None:
                             }
                             if session_scope:
                                 run_kwargs["session_id"] = session_scope
+                            set_current_caller_telegram_id(user_id_for_memory)
+                            _arun_t0 = time.perf_counter()
                             run_output = await agent_context.agent.arun(agent_input, **run_kwargs)
                             run_status = str(getattr(run_output, "status", ""))
                             run_content = str(getattr(run_output, "content", "") or "").strip()
                             logger.info(
-                                "audio direct-run completed update_id=%s status=%s has_content=%s",
+                                "[LLM] arun done   update_id=%s  %.1fs  status=%s  has_content=%s",
                                 update_id,
+                                time.perf_counter() - _arun_t0,
                                 run_status,
                                 bool(run_content),
                             )
@@ -784,10 +805,9 @@ async def run_telegram_polling_loop() -> None:
                     if not existing_text:
                         continue
                     logger.info(
-                        "text direct-run update_id=%s user_id=%s session_scope=%s text=%s",
+                        "[LLM] arun start  update_id=%s user_id=%s kind=text input=%s",
                         update_id,
                         user_id_for_memory,
-                        session_scope,
                         _truncate(existing_text),
                     )
                     try:
@@ -797,8 +817,11 @@ async def run_telegram_polling_loop() -> None:
                         }
                         if session_scope:
                             run_kwargs["session_id"] = session_scope
+                        set_current_caller_telegram_id(user_id_for_memory)
+                        _arun_t0 = time.perf_counter()
                         run_output = await agent_context.agent.arun(existing_text, **run_kwargs)
                         run_content = str(getattr(run_output, "content", "") or "").strip()
+                        logger.info("[LLM] arun done   update_id=%s  %.1fs  has_content=%s", update_id, time.perf_counter() - _arun_t0, bool(run_content))
                         if chat_id_for_send is not None:
                             if run_content:
                                 await _send_telegram_message(
@@ -830,9 +853,6 @@ async def run_telegram_polling_loop() -> None:
                     raise
                 except Exception:
                     logger.exception("update processing failed update_id=%s", update_id)
-                finally:
-                    reset_current_requester_email(requester_email_token)
-                    reset_current_run_attachment_for_tools(attachment_token)
 
 
 async def startup_diagnostics() -> None:
@@ -862,6 +882,11 @@ async def startup_diagnostics() -> None:
         "agno skills enabled_dir=%s loaded=%s",
         agent_context.skills_dir or "disabled",
         ", ".join(agent_context.skill_names) if agent_context.skill_names else "none",
+    )
+    logger.info(
+        "scheduler enabled base_url=%s poll_interval=%ss",
+        _scheduler_base_url,
+        os.getenv("SCHEDULER_POLL_INTERVAL", "60"),
     )
     logger.info(
         "audio transcription enabled whisper_model=%s whisper_language=%s audio_temp_dir=%s prefer_memory_language=%s audio_add_history_to_context=%s",
