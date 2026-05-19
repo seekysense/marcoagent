@@ -59,12 +59,23 @@ def _normalize_phone(phone: str) -> str:
         return "+" + phone
     return "+39" + phone
 
-_ROME_TZ = ZoneInfo("Europe/Rome")
 _UTC_TZ = ZoneInfo("UTC")
 
 
+def _local_tz() -> ZoneInfo:
+    tz_name = (os.getenv("AGENT_TIMEZONE") or "Europe/Rome").strip()
+    try:
+        return ZoneInfo(tz_name)
+    except Exception:
+        return ZoneInfo("Europe/Rome")
+
+
+# Computed once at module load (after dotenv is loaded) for use in static strings.
+_TZ_NAME: str = _local_tz().key
+
+
 def _parse_at_to_utc(at: str) -> str:
-    """Convert a datetime string to UTC ISO 8601. Naive datetimes are assumed to be Europe/Rome."""
+    """Convert a datetime string to UTC ISO 8601. Naive datetimes are assumed to be local timezone."""
     at = at.strip().replace(" ", "T")
     if at.endswith("Z"):
         at = at[:-1] + "+00:00"
@@ -73,12 +84,12 @@ def _parse_at_to_utc(at: str) -> str:
     except ValueError:
         return at  # unparseable: pass through and let the API reject it
     if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=_ROME_TZ)
+        dt = dt.replace(tzinfo=_local_tz())
     return dt.astimezone(_UTC_TZ).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def _utc_to_rome(utc_str: str) -> str:
-    """Convert a UTC ISO 8601 string to Europe/Rome for display."""
+def _utc_to_local(utc_str: str) -> str:
+    """Convert a UTC ISO 8601 string to local timezone for display."""
     try:
         s = utc_str.strip()
         if s.endswith("Z"):
@@ -86,7 +97,7 @@ def _utc_to_rome(utc_str: str) -> str:
         dt = datetime.fromisoformat(s)
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=_UTC_TZ)
-        return dt.astimezone(_ROME_TZ).strftime("%d/%m/%Y %H:%M")
+        return dt.astimezone(_local_tz()).strftime("%d/%m/%Y %H:%M")
     except Exception:
         return utc_str
 
@@ -407,7 +418,7 @@ def _castelletto_run_sequence_impl(camera_id: str, sequence_id: str, at: str) ->
     if at:
         at_utc = _parse_at_to_utc(at)
         params["at"] = at_utc
-        at_rome_display = _utc_to_rome(at_utc)
+        at_rome_display = _utc_to_local(at_utc)
 
     try:
         with httpx.Client(timeout=timeout, follow_redirects=True) as client:
@@ -614,7 +625,7 @@ def _pms_get_reservations_impl(
         stay_date,
     ])
     if not has_any_date:
-        params["arrivalDateFrom"] = date.today().isoformat()
+        params["arrivalDateFrom"] = datetime.now(tz=_local_tz()).date().isoformat()
     else:
         if arrival_date_from:
             params["arrivalDateFrom"] = arrival_date_from
@@ -707,8 +718,8 @@ REMINDER_TOOL_PROMPT = (
     "Usa questi tool per creare, elencare ed eliminare pro-memoria schedulati.\n\n"
     "reminder_create — crea un reminder condizionale:\n"
     "  - name: nome univoco breve (es. 'check-colazione-7am')\n"
-    "  - cron_expr: 5 campi cron, timezone Europe/Rome "
-    "(es. '0 7 * * *' = ogni giorno alle 7, '15 7 * * 1-5' = lun-ven alle 7:15)\n"
+    f"  - cron_expr: 5 campi cron, timezone {_TZ_NAME} "
+    f"(es. '0 7 * * *' = ogni giorno alle 7, '15 7 * * 1-5' = lun-ven alle 7:15)\n"
     "  - task_description: istruzione completa per il run schedulato — deve descrivere "
     "COSA controllare (tool da usare, telecamera, ecc.) e COSA fare se la condizione è vera "
     "(es. inviare send_telegram_message al chat_id). Includi sempre il chat_id del destinatario.\n"
@@ -768,13 +779,13 @@ def reminder_create(name: str, cron_expr: str, task_description: str, chat_id: s
             method="POST",
             description=task_description[:200],
             payload=payload,
-            timezone="Europe/Rome",
+            timezone=_TZ_NAME,
             if_exists="update",
         )
         _tlog.info("[DONE] reminder_create  %.1fs | id=%s", time.perf_counter() - _t0, schedule.id)
         return (
             f"Reminder '{schedule.name}' creato.\n"
-            f"Cron: {schedule.cron_expr} (Europe/Rome)\n"
+            f"Cron: {schedule.cron_expr} ({_TZ_NAME})\n"
             f"Descrizione: {schedule.description}"
         )
     except Exception as exc:
@@ -807,7 +818,7 @@ def reminder_list() -> str:
         status = "✓" if s.enabled else "✗"
         next_run = ""
         if s.next_run_at:
-            dt = datetime.fromtimestamp(s.next_run_at, tz=_ROME_TZ)
+            dt = datetime.fromtimestamp(s.next_run_at, tz=_local_tz())
             next_run = f" | prossima esecuzione: {dt.strftime('%d/%m/%Y %H:%M')}"
         lines.append(f"  {status} {s.name} [{s.cron_expr}]{next_run}")
         if s.description:

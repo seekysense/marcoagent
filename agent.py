@@ -57,6 +57,10 @@ def _memory_capture_instructions() -> str:
     return _default_memory_capture_instructions()
 
 
+def _agent_timezone() -> str:
+    return (os.getenv("AGENT_TIMEZONE") or "Europe/Rome").strip()
+
+
 def _memory_additional_instructions() -> str | None:
     value = os.getenv("MEMORY_ADDITIONAL_INSTRUCTIONS")
     if value and value.strip():
@@ -86,13 +90,13 @@ def _agent_operational_instructions() -> list[str]:
         ),
         (
             "Per creare pro-memoria condizionali usa reminder_create. "
-            "Parametri: name (nome breve univoco), cron_expr (cron 5 campi, timezone Europe/Rome), "
+            f"Parametri: name (nome breve univoco), cron_expr (cron 5 campi, timezone {_agent_timezone()}), "
             "task_description (istruzione completa per il controllo e l'eventuale notifica), "
             "chat_id (ID Telegram dell'utente da notificare). "
             "Nella task_description specifica: quale tool usare (es. castelletto_camera_analyze), "
             "quale azione/telecamera, la condizione da verificare, e di usare send_telegram_message "
             "con il chat_id se la condizione è soddisfatta. "
-            "Esempi cron (Europe/Rome): '0 7 * * *' ogni giorno alle 7, '15 7 * * 1-5' lun-ven alle 7:15. "
+            f"Esempi cron ({_agent_timezone()}): '0 7 * * *' ogni giorno alle 7, '15 7 * * 1-5' lun-ven alle 7:15. "
             "Usa reminder_list per elencare i reminder attivi, reminder_delete per eliminarne uno. "
             "Durante l'esecuzione di un reminder, usa send_telegram_message SOLO se la condizione è vera."
         ),
@@ -193,6 +197,7 @@ def build_agent_context() -> AgentContext:
         send_media_to_model=_bool_env("LLM_SEND_MEDIA_TO_MODEL", True),
         store_media=_bool_env("LLM_STORE_MEDIA", False),
         add_datetime_to_context=True,
+        timezone_identifier=_agent_timezone(),
         markdown=True,
     )
 
